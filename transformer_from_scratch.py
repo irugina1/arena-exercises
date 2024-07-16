@@ -747,6 +747,7 @@ Fill in the function, where it says `pass` (this will be the basic pattern for m
 
 """
 
+import torch
 class LayerNorm(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -755,7 +756,10 @@ class LayerNorm(nn.Module):
         self.b = nn.Parameter(t.zeros(cfg.d_model))
 
     def forward(self, residual: Float[Tensor, "batch posn d_model"]) -> Float[Tensor, "batch posn d_model"]:
-        pass
+        mean = torch.mean(residual, axis=-1, keepdim=True)
+        variance = torch.sum((residual-mean) ** 2, axis=-1, keepdim=True) /  residual.shape[-1]
+        y = (residual-mean) / torch.sqrt(variance + cfg.layer_norm_eps) * self.w + self.b
+        return y
 
 rand_float_test(LayerNorm, [2, 4, 768])
 load_gpt2_test(LayerNorm, reference_gpt2.ln_final, cache["resid_post", 11])
@@ -783,7 +787,7 @@ class Embed(nn.Module):
         nn.init.normal_(self.W_E, std=self.cfg.init_range)
 
     def forward(self, tokens: Int[Tensor, "batch position"]) -> Float[Tensor, "batch position d_model"]:
-        pass
+        return self.W_E[tokens]
 
 rand_int_test(Embed, [2, 4])
 load_gpt2_test(Embed, reference_gpt2.embed, tokens)
@@ -818,7 +822,8 @@ class PosEmbed(nn.Module):
         nn.init.normal_(self.W_pos, std=self.cfg.init_range)
 
     def forward(self, tokens: Int[Tensor, "batch position"]) -> Float[Tensor, "batch position d_model"]:
-        pass
+        return self.W_pos[torch.arange(tokens.shape[-1])]
+
 
 rand_int_test(PosEmbed, [2, 4])
 load_gpt2_test(PosEmbed, reference_gpt2.pos_embed, tokens)
@@ -994,6 +999,15 @@ A couple of notes / hints:
 * The `"IGNORE"` buffer is a very large negative number. This is the value you should mask your attention scores with (i.e. set them to this number wherever you want the probabilities to be zero). We indicate the existence of a `self.IGNORE` attribute to VSCode's typechecker via the line `IGNORE: Float[Tensor, ""]` in the second line of the code below.
 """
 
+from math import sqrt
+
+cfg = Config(debug=True)
+random_input = t.randn([2, 4, 768]).to(device)
+
+import torch
+import math
+from torch import nn
+
 class Attention(nn.Module):
     IGNORE: Float[Tensor, ""]
 
@@ -1017,7 +1031,24 @@ class Attention(nn.Module):
     def forward(
         self, normalized_resid_pre: Float[Tensor, "batch posn d_model"]
     ) -> Float[Tensor, "batch posn d_model"]:
-        pass
+        # normalized_resid_pre (batch, posn, d_model)
+        # W_Q                  (n_heads, d_model, d_head)
+        # Q, K, V              (batch, n_heads, posn, d_head)
+
+        Q = torch.einsum('ijk,lkm->iljm', normalized_resid_pre, self.W_Q) + self.b_Q[None,:,None,:]
+        K = torch.einsum('ijk,lkm->iljm', normalized_resid_pre, self.W_K) + self.b_K[None,:,None,:]
+        V = torch.einsum('ijk,lkm->iljm', normalized_resid_pre, self.W_V) + self.b_V[None,:,None,:]
+
+        attention_scores = torch.einsum('abij,abkj->abik', Q, K)
+        scaled_attention_scores = attention_scores / sqrt(Q.shape[-1])
+        masked_attention_scores = self.apply_causal_mask(scaled_attention_scores)
+        attention_probs = torch.softmax(masked_attention_scores, axis=-1)
+
+        z = torch.einsum('ijkl,ijlh->ijkh', attention_probs, V)
+        residual_stream_out = torch.einsum('ijkh,jhm->ikm', z, self.W_O) + self.b_O[None,None,:]
+
+        return residual_stream_out
+
 
     def apply_causal_mask(
         self, attn_scores: Float[Tensor, "batch n_heads query_pos key_pos"]
@@ -1025,11 +1056,16 @@ class Attention(nn.Module):
         '''
         Applies a causal mask to attention scores, and returns masked scores.
         '''
-        pass
+        all_ones = t.ones(attn_scores.size(-2), attn_scores.size(-1), device=attn_scores.device)
+        mask = t.triu(all_ones, diagonal=1).bool()
+        attn_scores.masked_fill_(mask, self.IGNORE)
+        return attn_scores
 
-tests.test_causal_mask(Attention.apply_causal_mask)
+
 rand_float_test(Attention, [2, 4, 768])
 load_gpt2_test(Attention, reference_gpt2.blocks[0].attn, cache["normalized", 0, "ln1"])
+
+# Attention
 
 """<details>
 <summary>Hint (pseudocode for both functions)</summary>
@@ -1088,7 +1124,10 @@ class MLP(nn.Module):
     def forward(
         self, normalized_resid_mid: Float[Tensor, "batch posn d_model"]
     ) -> Float[Tensor, "batch posn d_model"]:
-        pass
+        hidden = torch.einsum('bld,dh->blh', normalized_resid_mid, self.W_in) + self.b_in
+        activation = gelu_new(hidden)
+        out = torch.einsum('blh,hd->bld', activation, self.W_out) + self.b_out
+        return out
 
 rand_float_test(MLP, [2, 4, 768])
 load_gpt2_test(MLP, reference_gpt2.blocks[0].mlp, cache["normalized", 0, "ln2"])
@@ -1118,7 +1157,9 @@ class TransformerBlock(nn.Module):
     def forward(
         self, resid_pre: Float[Tensor, "batch position d_model"]
     ) -> Float[Tensor, "batch position d_model"]:
-        pass
+        resid_mid = resid_pre + self.attn(self.ln1(resid_pre))
+        resid_post = resid_mid + self.mlp(self.ln2(resid_mid))
+        return resid_post
 
 rand_float_test(TransformerBlock, [2, 4, 768])
 load_gpt2_test(TransformerBlock, reference_gpt2.blocks[0], cache["resid_pre", 0])
@@ -1153,7 +1194,7 @@ class Unembed(nn.Module):
     def forward(
         self, normalized_resid_final: Float[Tensor, "batch position d_model"]
     ) -> Float[Tensor, "batch position d_vocab"]:
-        pass
+        return torch.einsum('ijk,kl->ijl', normalized_resid_final, self.W_U) + self.b_U
 
 rand_float_test(Unembed, [2, 4, 768])
 load_gpt2_test(Unembed, reference_gpt2.unembed, cache["ln_final.hook_normalized"])
@@ -1180,7 +1221,11 @@ class DemoTransformer(nn.Module):
         self.unembed = Unembed(cfg)
 
     def forward(self, tokens: Int[Tensor, "batch position"]) -> Float[Tensor, "batch position d_vocab"]:
-        pass
+        x = self.embed(tokens) + self.pos_embed(tokens)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_final(x)
+        return self.unembed(x)
 
 rand_int_test(DemoTransformer, [2, 4])
 load_gpt2_test(DemoTransformer, reference_gpt2, tokens)
@@ -1283,10 +1328,10 @@ class TransformerTrainingArgs():
     batch_size = 16
     epochs = 10
     max_steps_per_epoch = 200
-	lr = 1e-3
-	weight_decay = 1e-2
-	wandb_project: Optional[str] = "day1-demotransformer"
-	wandb_name: Optional[str] = None
+    lr = 1e-3
+    weight_decay = 1e-2
+    wandb_project: Optional[str] = "day1-demotransformer"
+    wandb_name: Optional[str] = None
 
 
 args = TransformerTrainingArgs()
@@ -1368,9 +1413,15 @@ class TransformerTrainer:
 
 		Remember that `batch` is a dictionary with the single key 'tokens'.
 		'''
-        # YOUR CODE HERE
-		pass
-
+		tokens = batch["tokens"].to(device)
+		logits = self.model(tokens)
+		loss = -get_log_probs(logits, tokens).mean()
+		self.optimizer.zero_grad()
+		loss.backward()
+		self.optimizer.step()
+		self.step += 1
+		wandb.log({"train_loss": loss})
+		return loss
 
 	def validation_step(self, batch: Dict[str, Int[Tensor, "batch seq"]]):
 		'''
@@ -1378,8 +1429,11 @@ class TransformerTrainer:
 		is correct). Logging should happen in the `train` function (after we've computed the accuracy for
 		the whole validation set).
 		'''
-        # YOUR CODE HERE
-		pass
+		tokens = batch["tokens"].to(device)
+		logits = self.model(tokens)  # batch, position, d_vocab
+		predictions = logits.argmax(dim=-1)
+		accuracy = (tokens[:,1:] == predictions[:,:-1]).sum() / tokens.numel()
+		return accuracy
 
 
 	def train(self):
@@ -1387,8 +1441,26 @@ class TransformerTrainer:
 		Trains the model, for `self.args.epochs` epochs. Also handles wandb initialisation, and early stopping
 		for each epoch at `self.args.max_steps_per_epoch` steps.
 		'''
-        # YOUR CODE HERE
-		pass
+		wandb.init(project=self.args.wandb_project, name=self.args.wandb_name, config=self.args)
+		for epoch in range(self.args.epochs):
+			num_steps_in_epoch = 0
+			for batch in tqdm(self.train_loader()):
+				self.training_step(batch)
+				num_steps_in_epoch += 1
+				if num_steps_in_epoch >= self.args.max_steps_per_epoch:
+					break
+			all_accuracies = []
+			all_num_in_batch = []
+			for batch in self.test_loader():
+				accuracy = self.validation_step(batch)
+				num_in_batch = batch["tokens"].shape[0]
+				all_accuracies.append(accuracy.item())
+				all_num_in_batch.append(num_in_batch)
+			all_accuracies = torch.from_numpy(np.array(all_accuracies))
+			all_num_in_batch = torch.from_numpy(np.array(all_num_in_batch))
+			wandb.log({"val_accuracy":
+			           torch.sum(all_accuracies * all_num_in_batch / all_num_in_batch.sum())})
+		wandb.finish()
 
 
 	def train_loader(self) -> DataLoader:
@@ -1455,10 +1527,10 @@ wandb.finish()
 </details>
 """
 
-model = DemoTransformer(model_cfg).to(device)
-args = TransformerTrainingArgs()
-trainer = TransformerTrainer(args, model)
-trainer.train()
+# model = DemoTransformer(model_cfg).to(device)
+# args = TransformerTrainingArgs()
+# trainer = TransformerTrainer(args, model)
+# trainer.train()
 
 """When you run the code for the first time, you'll have to login to Weights and Biases, and paste an API key into VSCode. After this is done, your Weights and Biases training run will start. It'll give you a lot of output text, one line of which will look like:
 
@@ -1588,7 +1660,22 @@ class TransformerSampler:
         kwargs are passed to sample_next_token, to give detailed instructions on how
         new tokens are chosen.
         '''
-        pass
+        self.model.eval()
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(device)
+        stop_sampling = False
+        tokens_generated = 0
+        while not stop_sampling:
+          logits = self.model(input_ids)
+          last_token_logits = logits[:,-1]
+          new_token = self.sample_next_token(input_ids[0], last_token_logits[0], **kwargs)
+          input_ids = torch.cat([input_ids, torch.tensor([[new_token]]).to(device)], dim=-1)
+          tokens_generated += 1
+          if new_token == self.tokenizer.eos_token_id or tokens_generated == max_tokens_generated:
+            stop_sampling = True
+        output = self.tokenizer.decode(input_ids[0])
+        return output
+
+
 
 
     @t.inference_mode()
@@ -1662,7 +1749,7 @@ class TransformerSampler:
         '''
         Applies temperature scaling to the logits.
         '''
-        pass
+        return logits / temperature
 
 
     @staticmethod
@@ -1670,7 +1757,8 @@ class TransformerSampler:
         '''
         Applies a frequency penalty to the logits.
         '''
-        pass
+        freq = t.bincount(input_ids, minlength=logits.shape[-1])
+        return logits - freq_penalty * freq
 
 
     @staticmethod
@@ -1678,7 +1766,8 @@ class TransformerSampler:
         '''
         Samples from the distribution defined by the logits.
         '''
-        pass
+        new_token = t.distributions.categorical.Categorical(logits=logits).sample().item()
+        return new_token
 
 
     @staticmethod
@@ -1686,7 +1775,12 @@ class TransformerSampler:
         '''
         Samples from the top k most likely tokens.
         '''
-        pass
+        topk_logits, topk_logits_indices = t.topk(logits, k)
+        sample = t.distributions.categorical.Categorical(logits=topk_logits).sample()
+        sample_token_idx = topk_logits_indices[sample].item()
+        return sample_token_idx
+
+
 
 
     @staticmethod
@@ -1694,7 +1788,15 @@ class TransformerSampler:
         '''
         Samples from the most likely tokens which make up at least p cumulative probability.
         '''
-        pass
+        logits = torch.softmax(logits, axis=-1)
+        sorted, indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(sorted, axis=-1)
+        cuttoff_idx = torch.tensor(max((cumulative_probs >= top_p).nonzero()[0].item(), min_tokens_to_keep)).to(device)
+        sample = t.distributions.categorical.Categorical(sorted[:cuttoff_idx+1]).sample()
+        sample_token_idx = indices[sample].item()
+        return sample_token_idx
+
+
 
 """## Main Sampling Function
 
@@ -2177,7 +2279,31 @@ class Beams:
         Optional argument `no_repeat_ngram_size` means your model won't generate any sequences with
         a repeating n-gram of this length.
         '''
-        pass
+
+        output = self.model(self.tokens)
+        logits = output[:, -1, :]
+        logprobs = nn.LogSoftmax(dim=-1)(logits)
+
+        top_logits, top_token_ids = self.get_topk_non_repeating(
+            logprobs,
+            no_repeat_ngram_size,
+            toks_per_beam
+        )
+
+        new_tokens = self.tokens.repeat_interleave(toks_per_beam, dim=0)
+        new_top_token_ids = top_token_ids.reshape((top_token_ids.numel(), 1))
+        new_tokens = torch.cat((new_tokens, new_top_token_ids), dim=1)
+
+        new_logprob_sums = self.logprob_sums.repeat_interleave(toks_per_beam, dim=0)
+        idx1 = torch.arange(logprobs.shape[0]).view(-1, 1).int()
+        idx2 = top_token_ids.to(device).int()
+        logprobs = logprobs[idx1, idx2]
+        logprobs = logprobs.reshape((logprobs.numel(),))
+        new_logprob_sums = new_logprob_sums + logprobs
+
+        return self.new_beams(new_logprob_sums, new_tokens)
+
+
 
     def filter(self, num_beams: int) -> Tuple["Beams", "Beams"]:
         '''
@@ -2189,7 +2315,24 @@ class Beams:
                 filtered version of self, containing all best `num_beams` which are also terminated.
                 i.e. the sum of lengths of these two should equal `num_beams`.
         '''
-        pass
+        all_best_logprobs, all_best_tokens_idxs = self.logprob_sums.topk(k=num_beams, dim=-1)
+        all_best_token_seqs = self.tokens[all_best_tokens_idxs, :]
+
+        nonterminated_indices = all_best_token_seqs[:, -1] != self.tokenizer.eos_token_id
+        nonterminated_tokens = all_best_token_seqs[(nonterminated_indices).nonzero().squeeze(1)]
+        nonterminated_logprobs = all_best_logprobs[(nonterminated_indices).nonzero().squeeze(1)]
+
+        terminated_indices = all_best_token_seqs[:, -1] == self.tokenizer.eos_token_id
+        terminated_tokens = all_best_token_seqs[(terminated_indices).nonzero().squeeze(1)]
+        terminated_logprobs = all_best_logprobs[(terminated_indices).nonzero().squeeze(1)]
+
+        best_beams = self.new_beams(nonterminated_logprobs, nonterminated_tokens)
+        early_terminations = self.new_beams(terminated_logprobs, terminated_tokens)
+
+        return best_beams, early_terminations
+
+
+
 
     def print(self, title="Best completions", max_print_chars=80) -> None:
         '''
@@ -2273,7 +2416,7 @@ def beam_search(
     assert num_return_sequences <= num_beams
     self.model.eval()
 
-        pass
+    pass
 
 """Example usage of the `Beams` class, and the `print` method (not the logitsums aren't necessarily accurate, this example is just an illustration):
 
@@ -2407,6 +2550,48 @@ def filter(self, num_beams: int) -> Tuple["Beams", "Beams"]:
 
 Once you've passed both these unit tests, you can try implementing the full beam search function. It should create a `Beams` object from the initial prompt, and then repeatedly call `generate` and `filter` until the stopping criteria are met.
 """
+
+@t.inference_mode()
+def beam_search(
+    self: TransformerSampler,
+    prompt: str,
+    num_return_sequences: int,
+    num_beams: int,
+    max_new_tokens: int,
+    no_repeat_ngram_size: Optional[int] = None,
+    verbose=False
+) -> List[Tuple[float, Tensor]]:
+    '''
+    Implements a beam search, by repeatedly performing the `generate` and `filter` steps (starting
+    from the initial prompt) until either of the two stopping criteria are met:
+
+        (1) we've generated `max_new_tokens` tokens, or
+        (2) we've generated `num_returns_sequences` terminating sequences.
+
+    To modularize this function, most of the actual complexity is in the Beams class,
+    in the `generate` and `filter` methods.
+    '''
+
+    assert num_return_sequences <= num_beams
+    self.model.eval()
+
+    init_tokens = self.tokenizer.encode(prompt, return_tensors="pt").to(device)
+    # we can set init_logprob_sums to zero because it's a constant anyway
+    beams = Beams(self.model, self.tokenizer, t.tensor([0.0]).to(device), init_tokens)
+
+    result = []
+
+    for n in tqdm(range(max_new_tokens)):
+        beams = beams.generate(toks_per_beam=num_beams, no_repeat_ngram_size=no_repeat_ngram_size)
+        beams, terminated = beams.filter(num_beams=num_beams)
+        result.extend(terminated.logprobs_and_completions)
+
+        if len(result) >= num_return_sequences:
+            break
+
+    result.extend(beams.logprobs_and_completions)
+    result = result[0:num_return_sequences]
+    return result
 
 TransformerSampler.beam_search = beam_search
 
